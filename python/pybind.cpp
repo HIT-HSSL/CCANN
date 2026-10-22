@@ -32,6 +32,14 @@
 namespace py = pybind11;
 
 namespace {
+constexpr uint64_t kPythonGraphDegree = 32;
+
+void require_supported_dynamic_layout(uint64_t max_node_len, uint64_t nodes_per_sector) {
+  if (nodes_per_sector == 0 || max_node_len > SECTOR_LEN)
+    throw py::value_error("CCANN dynamic SSD node size " + std::to_string(max_node_len) +
+                          " exceeds the " + std::to_string(SECTOR_LEN) + "-byte sector size");
+}
+
 std::vector<float> normalize_cosine_vector(const float *data, size_t dim) {
   double norm_squared = 0;
   for (size_t i = 0; i < dim; ++i) {
@@ -97,6 +105,9 @@ class PySSDIndex {
       throw py::value_error("Expected at least 256 float32 vectors, matching uint32 tags, and positive threads");
     if (metric != ccann::Metric::L2 && metric != ccann::Metric::COSINE)
       throw py::value_error("Only L2 and cosine are supported by the SSD Python index");
+    uint64_t max_node_len = static_cast<uint64_t>(vectors.shape(1)) * sizeof(float) +
+                            (kPythonGraphDegree + 1) * sizeof(uint32_t);
+    require_supported_dynamic_layout(max_node_len, SECTOR_LEN / max_node_len);
     std::set<uint32_t> unique_tags(tags.data(), tags.data() + tags.shape(0));
     if (unique_tags.size() != static_cast<size_t>(tags.shape(0)))
       throw py::value_error("Tags must be unique");
@@ -121,7 +132,7 @@ class PySSDIndex {
     bool built;
     {
       py::gil_scoped_release release;
-      built = ccann::build_disk_index_py<float, uint32_t>(data_path.c_str(), prefix.c_str(), 32, 64, 1,
+      built = ccann::build_disk_index_py<float, uint32_t>(data_path.c_str(), prefix.c_str(), kPythonGraphDegree, 64, 1,
                                                           threads, chunks, metric, false, tags_path.c_str());
     }
     if (!built)
@@ -165,7 +176,7 @@ class PySSDIndex {
         !std::filesystem::exists(utf8_path(prefix + "_disk.index.tags")))
       throw py::value_error("Missing SSD index files");
     uint32_t graph_count, graph_columns, pq_count, pq_dim, tag_count, tag_dim;
-    uint64_t disk_count, disk_dim;
+    uint64_t disk_count, disk_dim, max_node_len, nodes_per_sector;
     std::ifstream graph(utf8_path(prefix + "_disk.index"), std::ios::binary);
     std::ifstream pq(utf8_path(prefix + "_pq_compressed.bin"), std::ios::binary);
     std::ifstream tag_file(utf8_path(prefix + "_disk.index.tags"), std::ios::binary);
@@ -173,6 +184,9 @@ class PySSDIndex {
     graph.read(reinterpret_cast<char *>(&graph_columns), sizeof(graph_columns));
     graph.read(reinterpret_cast<char *>(&disk_count), sizeof(disk_count));
     graph.read(reinterpret_cast<char *>(&disk_dim), sizeof(disk_dim));
+    graph.seekg(sizeof(uint64_t), std::ios::cur);
+    graph.read(reinterpret_cast<char *>(&max_node_len), sizeof(max_node_len));
+    graph.read(reinterpret_cast<char *>(&nodes_per_sector), sizeof(nodes_per_sector));
     pq.read(reinterpret_cast<char *>(&pq_count), sizeof(pq_count));
     pq.read(reinterpret_cast<char *>(&pq_dim), sizeof(pq_dim));
     tag_file.read(reinterpret_cast<char *>(&tag_count), sizeof(tag_count));
@@ -183,6 +197,7 @@ class PySSDIndex {
         std::filesystem::file_size(utf8_path(prefix + "_pq_compressed.bin")) < 8ull + uint64_t(pq_count) * pq_dim ||
         std::filesystem::file_size(utf8_path(prefix + "_disk.index.tags")) < 8ull + uint64_t(tag_count) * sizeof(uint32_t))
       throw py::value_error("Corrupt or incompatible SSD index files");
+    require_supported_dynamic_layout(max_node_len, nodes_per_sector);
     if (std::filesystem::exists(utf8_path(prefix + "_disk.index.id2loc")) &&
         std::filesystem::file_size(utf8_path(prefix + "_disk.index.id2loc")) < uint64_t(pq_count) * sizeof(uint32_t))
       throw py::value_error("Corrupt SSD location mapping");

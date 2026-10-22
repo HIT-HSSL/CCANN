@@ -1,11 +1,79 @@
 """Platform checks for the native Python graph index."""
 
+import subprocess
+import struct
 import sys
 
 import numpy as np
 import pytest
 
 import ccannpy
+
+
+def test_oversized_native_nodes_raise_instead_of_crashing(tmp_path):
+    prefix = str(tmp_path / "oversized")
+    script = r"""
+import sys
+
+import ccannpy
+import numpy as np
+
+vectors = np.random.default_rng(42).normal(size=(256, 2048)).astype(np.float32)
+tags = np.arange(256, dtype=np.uint32)
+try:
+    ccannpy.Index.create(
+        sys.argv[1], vectors, tags,
+        metric=ccannpy.Metric.COSINE, threads=4,
+    )
+except ValueError as error:
+    print(error)
+else:
+    raise AssertionError("oversized native nodes must be rejected")
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, prefix],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "exceeds the 4096-byte sector size" in completed.stdout
+
+
+def test_loading_oversized_native_nodes_raise_instead_of_crashing(tmp_path):
+    prefix = str(tmp_path / "oversized-load")
+    vectors = np.random.default_rng(43).random((256, 64), dtype=np.float32)
+    tags = np.arange(256, dtype=np.uint32)
+    index = ccannpy.Index.create(prefix, vectors, tags, threads=2)
+    del index
+
+    with open(prefix + "_disk.index", "r+b") as graph:
+        graph.seek(32)
+        graph.write(struct.pack("<QQ", 8324, 0))
+
+    script = r"""
+import sys
+
+import ccannpy
+
+try:
+    ccannpy.Index.load(sys.argv[1], threads=2)
+except ValueError as error:
+    print(error)
+else:
+    raise AssertionError("oversized native nodes must be rejected")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, prefix],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "exceeds the 4096-byte sector size" in completed.stdout
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows native wheel check")
