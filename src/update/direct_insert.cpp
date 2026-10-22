@@ -134,7 +134,7 @@ namespace ccann {
       if (loc > max_loc)
         max_loc = loc;
     }
-    extend_fsize = loc_sector_no(max_loc) * SECTOR_LEN + SECTOR_LEN;
+    extend_fsize = loc_sector_no(max_loc) * SECTOR_LEN + size_per_io;
     extend_fsize = extend_fsize > fsize ? extend_fsize : fsize;
 
     faddr = reader->get_dax(extend_fsize, false);

@@ -34,12 +34,6 @@ namespace py = pybind11;
 namespace {
 constexpr uint64_t kPythonGraphDegree = 32;
 
-void require_supported_dynamic_layout(uint64_t max_node_len, uint64_t nodes_per_sector) {
-  if (nodes_per_sector == 0 || max_node_len > SECTOR_LEN)
-    throw py::value_error("CCANN dynamic SSD node size " + std::to_string(max_node_len) +
-                          " exceeds the " + std::to_string(SECTOR_LEN) + "-byte sector size");
-}
-
 std::vector<float> normalize_cosine_vector(const float *data, size_t dim) {
   double norm_squared = 0;
   for (size_t i = 0; i < dim; ++i) {
@@ -105,9 +99,6 @@ class PySSDIndex {
       throw py::value_error("Expected at least 256 float32 vectors, matching uint32 tags, and positive threads");
     if (metric != ccann::Metric::L2 && metric != ccann::Metric::COSINE)
       throw py::value_error("Only L2 and cosine are supported by the SSD Python index");
-    uint64_t max_node_len = static_cast<uint64_t>(vectors.shape(1)) * sizeof(float) +
-                            (kPythonGraphDegree + 1) * sizeof(uint32_t);
-    require_supported_dynamic_layout(max_node_len, SECTOR_LEN / max_node_len);
     std::set<uint32_t> unique_tags(tags.data(), tags.data() + tags.shape(0));
     if (unique_tags.size() != static_cast<size_t>(tags.shape(0)))
       throw py::value_error("Tags must be unique");
@@ -191,13 +182,19 @@ class PySSDIndex {
     pq.read(reinterpret_cast<char *>(&pq_dim), sizeof(pq_dim));
     tag_file.read(reinterpret_cast<char *>(&tag_count), sizeof(tag_count));
     tag_file.read(reinterpret_cast<char *>(&tag_dim), sizeof(tag_dim));
+    const uint64_t expected_nodes_per_sector = max_node_len == 0 ? 0 : SECTOR_LEN / max_node_len;
+    const uint64_t sectors_per_node = max_node_len == 0 ? 0 :
+        (expected_nodes_per_sector > 0 ? 1 : (max_node_len + SECTOR_LEN - 1) / SECTOR_LEN);
+    const uint64_t page_capacity = expected_nodes_per_sector > 0 ? expected_nodes_per_sector : 1;
+    const uint64_t expected_graph_size = SECTOR_LEN +
+        ((disk_count + page_capacity - 1) / page_capacity) * sectors_per_node * SECTOR_LEN;
     if (!graph || !pq || !tag_file || disk_dim != dim || disk_count > pq_count ||
-        pq_count != tag_count || pq_dim == 0 || tag_dim != 1 ||
-        std::filesystem::file_size(utf8_path(prefix + "_disk.index")) < SECTOR_LEN ||
+        pq_count != tag_count || pq_dim == 0 || tag_dim != 1 || max_node_len == 0 ||
+        nodes_per_sector != expected_nodes_per_sector ||
+        std::filesystem::file_size(utf8_path(prefix + "_disk.index")) < expected_graph_size ||
         std::filesystem::file_size(utf8_path(prefix + "_pq_compressed.bin")) < 8ull + uint64_t(pq_count) * pq_dim ||
         std::filesystem::file_size(utf8_path(prefix + "_disk.index.tags")) < 8ull + uint64_t(tag_count) * sizeof(uint32_t))
       throw py::value_error("Corrupt or incompatible SSD index files");
-    require_supported_dynamic_layout(max_node_len, nodes_per_sector);
     if (std::filesystem::exists(utf8_path(prefix + "_disk.index.id2loc")) &&
         std::filesystem::file_size(utf8_path(prefix + "_disk.index.id2loc")) < uint64_t(pq_count) * sizeof(uint32_t))
       throw py::value_error("Corrupt SSD location mapping");

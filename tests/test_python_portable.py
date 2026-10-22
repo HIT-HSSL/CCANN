@@ -10,8 +10,8 @@ import pytest
 import ccannpy
 
 
-def test_oversized_native_nodes_raise_instead_of_crashing(tmp_path):
-    prefix = str(tmp_path / "oversized")
+def test_multisector_native_nodes_round_trip_in_subprocess(tmp_path):
+    prefix = str(tmp_path / "multisector")
     script = r"""
 import sys
 
@@ -20,29 +20,38 @@ import numpy as np
 
 vectors = np.random.default_rng(42).normal(size=(256, 2048)).astype(np.float32)
 tags = np.arange(256, dtype=np.uint32)
-try:
-    ccannpy.Index.create(
-        sys.argv[1], vectors, tags,
-        metric=ccannpy.Metric.COSINE, threads=4,
-    )
-except ValueError as error:
-    print(error)
-else:
-    raise AssertionError("oversized native nodes must be rejected")
+index = ccannpy.Index.create(
+    sys.argv[1], vectors, tags,
+    metric=ccannpy.Metric.COSINE, threads=4,
+)
+assert index.dimension == 2048
+assert index.search(vectors[7], 1)[0][0] == 7
+added = np.zeros(2048, dtype=np.float32)
+added[17] = 1
+index.add(added, 1000)
+assert index.search(added, 1)[0][0] == 1000
+index.remove(7)
+index.merge()
+del index
+restored = ccannpy.Index.load(
+    sys.argv[1], metric=ccannpy.Metric.COSINE, threads=4,
+)
+assert restored.npoints == 256
+assert restored.search(added, 1)[0][0] == 1000
+assert 7 not in restored.search(vectors[7], 10)[0]
 """
 
     completed = subprocess.run(
         [sys.executable, "-c", script, prefix],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=180,
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "exceeds the 4096-byte sector size" in completed.stdout
 
 
-def test_loading_oversized_native_nodes_raise_instead_of_crashing(tmp_path):
+def test_loading_inconsistent_multisector_metadata_raises_instead_of_crashing(tmp_path):
     prefix = str(tmp_path / "oversized-load")
     vectors = np.random.default_rng(43).random((256, 64), dtype=np.float32)
     tags = np.arange(256, dtype=np.uint32)
@@ -63,7 +72,7 @@ try:
 except ValueError as error:
     print(error)
 else:
-    raise AssertionError("oversized native nodes must be rejected")
+    raise AssertionError("inconsistent multi-sector metadata must be rejected")
 """
     completed = subprocess.run(
         [sys.executable, "-c", script, prefix],
@@ -73,7 +82,7 @@ else:
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "exceeds the 4096-byte sector size" in completed.stdout
+    assert "Corrupt or incompatible SSD index files" in completed.stdout
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows native wheel check")

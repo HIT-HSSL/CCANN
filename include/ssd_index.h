@@ -193,32 +193,40 @@ namespace ccann {
 
     // avoid integer overflow when * SECTOR_LEN.
     inline uint64_t loc_sector_no(uint64_t loc) {
-      return 1 + (nnodes_per_sector > 0 ? loc / nnodes_per_sector : loc * DIV_ROUND_UP(max_node_len, SECTOR_LEN));
+      return 1 + loc / nodes_per_page() * sectors_per_node();
+    }
+
+    inline uint64_t nodes_per_page() const {
+      return nnodes_per_sector > 0 ? nnodes_per_sector : 1;
+    }
+
+    inline uint64_t sectors_per_node() const {
+      return nnodes_per_sector > 0 ? 1 : DIV_ROUND_UP(max_node_len, SECTOR_LEN);
     }
 
     inline uint64_t sector_to_loc(uint64_t sector_no, uint32_t sector_off) {
-      return (sector_no - 1) * nnodes_per_sector + sector_off;
+      return (sector_no - 1) / sectors_per_node() * nodes_per_page() + sector_off;
     }
 
     void init_query_buf(QueryBuffer<T> &buf) {
       _u64 coord_alloc_size = ROUND_UP(MAX_N_CMPS * this->aligned_dim * sizeof(T), 256);
       ccann::alloc_aligned((void **) &buf.coord_scratch, coord_alloc_size, 256);
-      ccann::alloc_aligned((void **) &buf.sector_scratch, MAX_N_SECTOR_READS * SECTOR_LEN, SECTOR_LEN);
+      ccann::alloc_aligned((void **) &buf.sector_scratch, MAX_N_SECTOR_READS * size_per_io, SECTOR_LEN);
       // [MAX_N_COMPUTES * N_CHUNKS * MAX_DEGREE]
       ccann::alloc_aligned((void **) &buf.aligned_pq_coord_scratch, MAX_N_COMPUTES * 32768 * 32 * sizeof(_u8), 256);
       ccann::alloc_aligned((void **) &buf.aligned_pqtable_dist_scratch, 256 * MAX_PQ_CHUNKS * sizeof(float), 256);
       // [MAX_N_COMPUTES * MAX_DEGREE]
       ccann::alloc_aligned((void **) &buf.aligned_dist_scratch, MAX_N_COMPUTES * 512 * sizeof(float), 256);
       ccann::alloc_aligned((void **) &buf.aligned_query_T, this->aligned_dim * sizeof(T), 8 * sizeof(T));
-      ccann::alloc_aligned((void **) &buf.update_buf, (2 * MAX_N_EDGES + 1) * SECTOR_LEN,
+      ccann::alloc_aligned((void **) &buf.update_buf, (2 * MAX_N_EDGES + 1) * size_per_io,
                              SECTOR_LEN);  // 2x for read + write
 
       buf.visited = new tsl::robin_set<_u64>(4096);
 
-      memset(buf.sector_scratch, 0, MAX_N_SECTOR_READS * SECTOR_LEN);
+      memset(buf.sector_scratch, 0, MAX_N_SECTOR_READS * size_per_io);
       memset(buf.coord_scratch, 0, coord_alloc_size);
       memset(buf.aligned_query_T, 0, this->aligned_dim * sizeof(T));
-      memset(buf.update_buf, 0, (2 * MAX_N_EDGES + 1) * SECTOR_LEN);
+      memset(buf.update_buf, 0, (2 * MAX_N_EDGES + 1) * size_per_io);
     }
 
     QueryBuffer<T> *pop_query_buf(const T *query) {
@@ -605,7 +613,7 @@ namespace ccann {
     std::mutex alloc_lock;
     uint32_t loc2id(uint32_t loc) {
       uint32_t page = loc_sector_no(loc);
-      uint32_t offset = loc % nnodes_per_sector;
+      uint32_t offset = loc % nodes_per_page();
       uint32_t id = kInvalidID;
       page_layout.find_fn(page, [&](PageArr &v) { id = v[offset]; });
       return id;  // kInvalidID if fails.
@@ -613,10 +621,10 @@ namespace ccann {
 
     void set_loc2id(uint32_t loc, uint32_t id) {
       uint32_t page = loc_sector_no(loc);
-      uint32_t offset = loc % nnodes_per_sector;
+      uint32_t offset = loc % nodes_per_page();
       page_layout.upsert(page, [&](PageArr &v, libcuckoo::UpsertContext ctx) {
         if (ctx == libcuckoo::UpsertContext::NEWLY_INSERTED) {
-          for (uint32_t i = 0; i < nnodes_per_sector; ++i) {
+          for (uint32_t i = 0; i < nodes_per_page(); ++i) {
             v[i] = kInvalidID;
           }
         }
@@ -626,11 +634,11 @@ namespace ccann {
 
     void erase_loc2id(uint32_t loc) {
       uint32_t page = loc_sector_no(loc);
-      uint32_t offset = loc % nnodes_per_sector;
+      uint32_t offset = loc % nodes_per_page();
       page_layout.upsert(page, [&](PageArr &v) {
         v[offset] = kInvalidID;
         bool empty = true;
-        for (uint32_t i = 0; i < nnodes_per_sector; ++i) {
+        for (uint32_t i = 0; i < nodes_per_page(); ++i) {
           if (v[i] != kInvalidID) {
             empty = false;
             break;
@@ -662,7 +670,8 @@ namespace ccann {
       std::vector<uint64_t> ret;
       int cur = 0;
       // reuse.
-      uint32_t threshold = (nnodes_per_sector + kIndexSizeFactor - 1) / kIndexSizeFactor;
+      const uint32_t page_capacity = static_cast<uint32_t>(nodes_per_page());
+      uint32_t threshold = (page_capacity + kIndexSizeFactor - 1) / kIndexSizeFactor;
 
       // Rule #1: empty rule:
       uint32_t empty_page = kInvalidID;
@@ -670,7 +679,7 @@ namespace ccann {
         // allocate all the pages.
         page_layout.update_fn(empty_page, [&](PageArr &v) {
           // nnodes_per_sector is the number of nodes (VEC+NEIGHBORS) in a sector.
-          for (uint32_t i = 0; i < nnodes_per_sector; ++i) {
+          for (uint32_t i = 0; i < page_capacity; ++i) {
             if (v[i] != kInvalidID) {
               LOG(ERROR) << "Page " << empty_page << " is not empty " << i << " " << v[i];
               crash();
@@ -694,7 +703,7 @@ namespace ccann {
         // see the hole number
         page_layout.update_fn(p, [&](PageArr &v) {
           uint32_t cnt = 0;
-          for (uint32_t i = 0; i < nnodes_per_sector; ++i) {
+          for (uint32_t i = 0; i < page_capacity; ++i) {
             uint32_t id = v[i];
             // the slot is empty.
             if (id == kInvalidID) {
@@ -705,11 +714,11 @@ namespace ccann {
             return;
           }
 
-          if (cnt < nnodes_per_sector) {
+          if (cnt < page_capacity) {
             page_need_to_read.insert(p);
           }
           // alloc them.
-          for (uint32_t i = 0; i < nnodes_per_sector; ++i) {
+          for (uint32_t i = 0; i < page_capacity; ++i) {
             if (v[i] == kInvalidID) {
               v[i] = kAllocatedID;
               ret.push_back(sector_to_loc(p, i));
@@ -737,8 +746,8 @@ namespace ccann {
       // ensure that cur_loc is aligned.
       // the hole will eventually be recycled using either empty page queue or hint pages.
       cur_loc += remaining;
-      if (cur_loc % nnodes_per_sector != 0) {
-        cur_loc += (nnodes_per_sector - (cur_loc % nnodes_per_sector));
+      if (cur_loc % page_capacity != 0) {
+        cur_loc += (page_capacity - (cur_loc % page_capacity));
       }
       return ret;
     }
@@ -749,6 +758,7 @@ namespace ccann {
       std::lock_guard<std::mutex> lock(alloc_lock);
       std::vector<uint64_t> ret;
       int cur = 0;
+      const uint32_t page_capacity = static_cast<uint32_t>(nodes_per_page());
 
       // Rule #1: empty rule:
       uint32_t empty_page = kInvalidID;
@@ -756,7 +766,7 @@ namespace ccann {
         // allocate all the pages.
         page_layout.update_fn(empty_page, [&](PageArr &v) {
           // nnodes_per_sector is the number of nodes (VEC+NEIGHBORS) in a sector.
-          for (uint32_t i = 0; i < nnodes_per_sector; ++i) {
+          for (uint32_t i = 0; i < page_capacity; ++i) {
             if (v[i] != kInvalidID) {
               LOG(ERROR) << "Page " << empty_page << " is not empty " << i << " " << v[i];
               crash();
@@ -793,7 +803,7 @@ namespace ccann {
         // see the hole number
         page_layout.update_fn(p, [&](PageArr &v) {
           uint32_t cnt = 0;
-          for (uint32_t i = 0; i < nnodes_per_sector; ++i) {
+          for (uint32_t i = 0; i < page_capacity; ++i) {
             uint32_t id = v[i];
             // the slot is empty.
             if (id == kInvalidID) {
@@ -801,17 +811,17 @@ namespace ccann {
             }
           }
 
-          if (cnt < nnodes_per_sector) {
+          if (cnt < page_capacity) {
             page_need_to_read.insert(p);
           }
 
           // this allocation allocates the entire page.
-          if (cnt + (n - cur) >= nnodes_per_sector) {
+          if (cnt + (n - cur) >= page_capacity) {
             // remove the page from hint_pages to avoid repeated scans.
             hint_pages_to_remove.push_back(p);
           }
           // alloc them.
-          for (uint32_t i = 0; i < nnodes_per_sector; ++i) {
+          for (uint32_t i = 0; i < page_capacity; ++i) {
             if (v[i] == kInvalidID) {
               v[i] = kAllocatedID;
               ret.push_back(sector_to_loc(p, i));
@@ -843,8 +853,8 @@ namespace ccann {
       // ensure that cur_loc is aligned.
       // the hole will eventually be recycled using either empty page queue or hint pages.
       cur_loc += remaining;
-      if (cur_loc % nnodes_per_sector != 0) {
-        cur_loc += (nnodes_per_sector - (cur_loc % nnodes_per_sector));
+      if (cur_loc % page_capacity != 0) {
+        cur_loc += (page_capacity - (cur_loc % page_capacity));
       }
       return ret;
     }

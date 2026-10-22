@@ -287,8 +287,9 @@ namespace ccann {
   template<typename T, typename TagT>
   void SSDIndex<T, TagT>::load_page_layout(const std::string &index_prefix, const _u64 nnodes_per_sector,
                                            const _u64 num_points) {
+    const uint64_t page_capacity = nodes_per_page();
     std::string partition_file = index_prefix + "_partition.bin.aligned";
-    if (std::filesystem::exists(utf8_path(partition_file))) {
+    if (nnodes_per_sector > 0 && std::filesystem::exists(utf8_path(partition_file))) {
       LOG(INFO) << "Loading partition file " << partition_file;
       std::ifstream part(utf8_path(partition_file), std::ios::binary);
       _u64 C, partition_nums, nd;
@@ -335,22 +336,22 @@ namespace ccann {
       }
 
       uint64_t page_offset = loc_sector_no(0);
-      uint64_t num_sectors = (num_points + nnodes_per_sector - 1) / nnodes_per_sector;
+      uint64_t num_sectors = (num_points + page_capacity - 1) / page_capacity;
 #pragma omp parallel for
       for (int64_t i = 0; i < static_cast<int64_t>(num_sectors); ++i) {
         PageArr tmp_arr;
-        for (uint32_t j = 0; j < nnodes_per_sector; ++j) {
-          uint64_t id = i * nnodes_per_sector + j;
+        for (uint32_t j = 0; j < page_capacity; ++j) {
+          uint64_t id = i * page_capacity + j;
           tmp_arr[j] = id < num_points ? id : kInvalidID;
         }
-        for (uint32_t j = nnodes_per_sector; j < tmp_arr.size(); ++j) {
+        for (uint32_t j = page_capacity; j < tmp_arr.size(); ++j) {
           tmp_arr[j] = kInvalidID;
         }
         this->page_layout.insert(i + page_offset, tmp_arr);
       }
       this->cur_loc = num_points;
-      if (num_points % nnodes_per_sector != 0) {
-        cur_loc += nnodes_per_sector - (num_points % nnodes_per_sector);
+      if (num_points % page_capacity != 0) {
+        cur_loc += page_capacity - (num_points % page_capacity);
       }
     }
     LOG(INFO) << "Cur location: " << this->cur_loc;
@@ -583,9 +584,9 @@ namespace ccann {
           layout.fill(kInvalidID);
           this->page_layout.insert(page, layout);
         }
-        this->page_layout.update_fn(page, [&, loc, id](PageArr &value) { value[loc % nnodes_per_sector] = id; });
+        this->page_layout.update_fn(page, [&, loc, id](PageArr &value) { value[loc % nodes_per_page()] = id; });
       }
-      this->cur_loc = ROUND_UP(max_loc + 1, nnodes_per_sector);
+      this->cur_loc = ROUND_UP(max_loc + 1, nodes_per_page());
     }
 
     // load tags

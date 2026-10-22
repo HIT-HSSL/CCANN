@@ -50,18 +50,20 @@ namespace ccann {
     uint32_t first_live_id = kInvalidID;
     Timer delete_timer;
 
+    const uint64_t page_capacity = nodes_per_page();
+    const uint64_t pages_per_merge = std::max<uint64_t>(1, SECTORS_PER_MERGE * SECTOR_LEN / size_per_io);
     char *rbuf = nullptr, *wbuf = nullptr;
-    alloc_aligned((void **) &rbuf, SECTORS_PER_MERGE * SECTOR_LEN, SECTOR_LEN);
-    uint64_t n_sectors = (cur_loc + nnodes_per_sector - 1) / nnodes_per_sector;
+    alloc_aligned((void **) &rbuf, pages_per_merge * size_per_io, SECTOR_LEN);
+    uint64_t n_sectors = (cur_loc + page_capacity - 1) / page_capacity;
     // LOG(INFO) << "Cur loc: " << cur_loc.load() << ", cur ID: " << cur_id << ", n_sectors: " << n_sectors
     //           << ", nnodes_per_sector: " << nnodes_per_sector;
 
-    constexpr int SECTORS_PER_POPULATE = 128;             // small to avoid blocking search threads.
+    const uint64_t SECTORS_PER_POPULATE = std::min<uint64_t>(128, pages_per_merge);  // small to avoid blocking search threads.
     uint32_t populate_nthreads = std::min(nthreads, 4u);  // restrict the flow.
 
     for (uint64_t in_sector = 0; in_sector < n_sectors; in_sector += SECTORS_PER_POPULATE) {
       uint64_t st_sector = in_sector, ed_sector = std::min(in_sector + SECTORS_PER_POPULATE, n_sectors);
-      uint64_t loc_st = st_sector * nnodes_per_sector, loc_ed = std::min(cur_loc.load(), ed_sector * nnodes_per_sector);
+      uint64_t loc_st = st_sector * page_capacity, loc_ed = std::min(cur_loc.load(), ed_sector * page_capacity);
       uint64_t n_sectors_to_read = ed_sector - st_sector;
       std::vector<IORequest> read_reqs;
       read_reqs.push_back(IORequest(loc_sector_no(loc_st) * SECTOR_LEN, n_sectors_to_read * size_per_io, rbuf, 0, 0));
@@ -85,7 +87,7 @@ namespace ccann {
         }
 
         // 3. deleted, populate nhoods.
-        auto page_rbuf = rbuf + (loc / nnodes_per_sector - st_sector) * SECTOR_LEN;
+        auto page_rbuf = rbuf + (loc / page_capacity - st_sector) * size_per_io;
         auto node_rbuf = offset_to_loc(page_rbuf, loc);
         DiskNode<T> node(id, offset_to_node_coords(node_rbuf), offset_to_node_nhood(node_rbuf));
         std::vector<uint32_t> nhood;
@@ -107,24 +109,24 @@ namespace ccann {
       aligned_free((void *) rbuf);
       throw std::invalid_argument("Cannot merge an index with no live points");
     }
-    alloc_aligned((void **) &wbuf, 2 * SECTORS_PER_MERGE * SECTOR_LEN, SECTOR_LEN);  // sliding window buffer.
+    alloc_aligned((void **) &wbuf, 2 * pages_per_merge * size_per_io, SECTOR_LEN);  // sliding window buffer.
     // LOG(INFO) << "Finished populating neighborhoods, totally elapsed: " << delete_timer.elapsed() / 1e3
     //           << "ms, new npoints: " << new_npoints.load() << " " << "id_map size: " << id_map.size();
 
     // Step 2: prune neighbors, populate PQ and tags.
     int fd = open(disk_index_out.c_str(), O_LARGEFILE | O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) throw std::system_error(errno, std::generic_category(), "open merged index");
-    const uint64_t kVecInWBuf = 2 * SECTORS_PER_MERGE * nnodes_per_sector;
+    const uint64_t kVecInWBuf = 2 * pages_per_merge * page_capacity;
     uint64_t wb_id = 0;
     std::atomic<uint64_t> n_used_id = 0;
     auto write_back = [&]() {
       // write one buffer.
-      uint64_t buf_id = (wb_id % kVecInWBuf) / (nnodes_per_sector * SECTORS_PER_MERGE);
-      auto b = wbuf + buf_id * SECTORS_PER_MERGE * SECTOR_LEN;
+      uint64_t buf_id = (wb_id % kVecInWBuf) / (page_capacity * pages_per_merge);
+      auto b = wbuf + buf_id * pages_per_merge * size_per_io;
       std::vector<IORequest> write_reqs;
-      uint64_t id_delta = std::min((uint64_t) SECTORS_PER_MERGE * nnodes_per_sector, n_used_id - wb_id);
+      uint64_t id_delta = std::min(pages_per_merge * page_capacity, n_used_id - wb_id);
       write_reqs.push_back(IORequest(loc_sector_no(wb_id) * SECTOR_LEN,
-                                     ROUND_UP(id_delta, nnodes_per_sector) / nnodes_per_sector * size_per_io, b, 0, 0));
+                                     ROUND_UP(id_delta, page_capacity) / page_capacity * size_per_io, b, 0, 0));
       for (const auto &request : write_reqs) {
         size_t written = 0;
         while (written < request.len) {
@@ -142,9 +144,9 @@ namespace ccann {
     std::vector<uint8_t> pq_coords(new_npoints * n_chunks, 0);
     std::vector<TagT> new_tags(new_npoints);
 
-    for (uint64_t in_sector = 0; in_sector < n_sectors; in_sector += SECTORS_PER_MERGE) {
-      uint64_t st_sector = in_sector, ed_sector = std::min(in_sector + SECTORS_PER_MERGE, n_sectors);
-      uint64_t loc_st = st_sector * nnodes_per_sector, loc_ed = std::min(cur_loc.load(), ed_sector * nnodes_per_sector);
+    for (uint64_t in_sector = 0; in_sector < n_sectors; in_sector += pages_per_merge) {
+      uint64_t st_sector = in_sector, ed_sector = std::min(in_sector + pages_per_merge, n_sectors);
+      uint64_t loc_st = st_sector * page_capacity, loc_ed = std::min(cur_loc.load(), ed_sector * page_capacity);
       uint64_t n_sectors_to_read = ed_sector - st_sector;
       std::vector<IORequest> read_reqs;
       read_reqs.push_back(IORequest(loc_sector_no(loc_st) * SECTOR_LEN, n_sectors_to_read * size_per_io, rbuf, 0, 0));
@@ -162,7 +164,7 @@ namespace ccann {
           continue;
         }
 
-        auto page_rbuf = rbuf + (loc / nnodes_per_sector - st_sector) * SECTOR_LEN;
+        auto page_rbuf = rbuf + (loc / page_capacity - st_sector) * size_per_io;
         auto loc_rbuf = offset_to_loc(page_rbuf, loc);
         DiskNode<T> node(id, offset_to_node_coords(loc_rbuf), offset_to_node_nhood(loc_rbuf));
         // prune neighbors.
@@ -207,7 +209,7 @@ namespace ccann {
         // write neighbors.
         uint64_t new_id = id_map.find(id);
         uint64_t off = new_id % kVecInWBuf;
-        auto page_wbuf = wbuf + (off / nnodes_per_sector) * SECTOR_LEN;
+        auto page_wbuf = wbuf + (off / page_capacity) * size_per_io;
         auto loc_wbuf = offset_to_loc(page_wbuf, off);
         DiskNode<T> w_node(new_id, offset_to_node_coords(loc_wbuf), offset_to_node_nhood(loc_wbuf));
         memcpy(w_node.coords, node.coords, data_dim * sizeof(T));
@@ -221,7 +223,7 @@ namespace ccann {
       }
 
       // LOG(INFO) << "Processed " << ed_sector << "/" << n_sectors << " sectors, n_used_id: " << n_used_id << ".";
-      if (n_used_id - wb_id >= SECTORS_PER_MERGE * nnodes_per_sector) {
+      if (n_used_id - wb_id >= pages_per_merge * page_capacity) {
         write_back();
       }
     }
@@ -271,7 +273,7 @@ namespace ccann {
                                                             const std::string &out_path_prefix, unsigned long last_id,
                                                             unsigned num_new_points) {
     auto new_npoints = last_id + num_new_points;
-    uint64_t file_size = SECTOR_LEN + ROUND_UP(new_npoints, nnodes_per_sector) / nnodes_per_sector * SECTOR_LEN;
+    uint64_t file_size = SECTOR_LEN + ROUND_UP(new_npoints, nodes_per_page()) / nodes_per_page() * size_per_io;
     std::vector<uint64_t> output_metadata;
     auto new_medoid = this->medoids[0];
 
@@ -336,7 +338,7 @@ namespace ccann {
   void SSDIndex<T, TagT>::write_metadata_and_pq(const std::string &in_path_prefix, const std::string &out_path_prefix,
                                                 const uint64_t &new_npoints, const uint64_t &new_medoid,
                                                 std::vector<TagT> *new_tags, std::vector<uint8_t> &pq_coords) {
-    uint64_t file_size = SECTOR_LEN + ROUND_UP(new_npoints, nnodes_per_sector) / nnodes_per_sector * SECTOR_LEN;
+    uint64_t file_size = SECTOR_LEN + ROUND_UP(new_npoints, nodes_per_page()) / nodes_per_page() * size_per_io;
     std::vector<uint64_t> output_metadata;
     output_metadata.push_back(new_npoints);
     output_metadata.push_back((uint64_t) this->data_dim);
@@ -391,8 +393,8 @@ namespace ccann {
 
     LOG(INFO) << "Reloading, num_points " << this->num_points << " n_chunks: " << this->n_chunks;
     this->cur_id = this->cur_loc = this->num_points;
-    if (this->num_points % nnodes_per_sector != 0) {
-      this->cur_loc += nnodes_per_sector - (num_points % nnodes_per_sector);
+    if (this->num_points % nodes_per_page() != 0) {
+      this->cur_loc += nodes_per_page() - (num_points % nodes_per_page());
     }
 
     while (!this->empty_pages.empty()) {

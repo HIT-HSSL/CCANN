@@ -386,15 +386,19 @@ namespace ccann {
 
     constexpr int kSectorsPerRead = 65536;
     constexpr int kSectorLen = 4096;
+    const uint64_t page_capacity = nnodes_per_sector > 0 ? nnodes_per_sector : 1;
+    const uint64_t sectors_per_node = nnodes_per_sector > 0 ? 1 : DIV_ROUND_UP(max_node_len, kSectorLen);
+    const uint64_t page_size = sectors_per_node * kSectorLen;
+    const uint64_t pages_per_read = std::max<uint64_t>(1, kSectorsPerRead * kSectorLen / page_size);
     char *buf;
-    ccann::alloc_aligned((void **) &buf, kSectorsPerRead * kSectorLen, kSectorLen);
-    uint64_t n_sectors = ROUND_UP(disk_nnodes, nnodes_per_sector) / nnodes_per_sector;
+    ccann::alloc_aligned((void **) &buf, pages_per_read * page_size, kSectorLen);
+    uint64_t n_sectors = ROUND_UP(disk_nnodes, page_capacity) / page_capacity;
     in.seekg(4096, in.beg);
-    for (uint64_t in_sector = 0; in_sector < n_sectors; in_sector += kSectorsPerRead) {
-      uint64_t st_sector = in_sector, ed_sector = std::min(in_sector + kSectorsPerRead, n_sectors);
-      uint64_t loc_st = st_sector * nnodes_per_sector, loc_ed = std::min(disk_nnodes, ed_sector * nnodes_per_sector);
+    for (uint64_t in_sector = 0; in_sector < n_sectors; in_sector += pages_per_read) {
+      uint64_t st_sector = in_sector, ed_sector = std::min(in_sector + pages_per_read, n_sectors);
+      uint64_t loc_st = st_sector * page_capacity, loc_ed = std::min(disk_nnodes, ed_sector * page_capacity);
       uint64_t n_sectors_to_read = ed_sector - st_sector;
-      in.read(buf, n_sectors_to_read * kSectorLen);
+      in.read(buf, n_sectors_to_read * page_size);
 
 #pragma omp parallel for
       for (int64_t loc = static_cast<int64_t>(loc_st); loc < static_cast<int64_t>(loc_ed); ++loc) {
@@ -405,7 +409,7 @@ namespace ccann {
           _tag_to_location[id] = id;
         }
 
-        auto page_rbuf = buf + (loc / nnodes_per_sector - st_sector) * kSectorLen;
+        auto page_rbuf = buf + (loc / page_capacity - st_sector) * page_size;
         auto node_rbuf = page_rbuf + (nnodes_per_sector == 0 ? 0 : ((_u64) loc % nnodes_per_sector) * max_node_len);
         DiskNode<T> node(id, (T *) node_rbuf, (unsigned *) (node_rbuf + data_dim * sizeof(T)));
 
